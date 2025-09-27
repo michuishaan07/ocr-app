@@ -1,0 +1,5 @@
+.env
+ocr_app.db
+__pycache__/
+*.pyc
+*.png
