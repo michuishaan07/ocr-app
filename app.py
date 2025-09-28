@@ -2,107 +2,175 @@ import streamlit as st
 from PIL import Image
 import google.generativeai as genai
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
 import io
 from datetime import datetime
 import os
 from dotenv import load_dotenv
 import hashlib
-import sqlite3
 import json
-import uuid
+from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
 
-# Database setup
+# Supabase connection
+@st.cache_resource
+def get_supabase_client():
+    """Get Supabase client"""
+    try:
+        url = os.getenv('SUPABASE_URL')
+        key = os.getenv('SUPABASE_ANON_KEY')
+        
+        if not url or not key:
+            st.error("Supabase URL and key are required in environment variables")
+            return None
+        
+        supabase: Client = create_client(url, key)
+        return supabase
+    except Exception as e:
+        st.error(f"Supabase connection failed: {str(e)}")
+        return None
+
 def init_db():
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
+    """Test Supabase connection and tables"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
     
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  email TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Documents table
-    c.execute('''CREATE TABLE IF NOT EXISTS documents
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  doc_name TEXT NOT NULL,
-                  extracted_texts TEXT NOT NULL,
-                  image_names TEXT NOT NULL,
-                  processing_settings TEXT NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (user_id) REFERENCES users (id))''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        # Test if tables exist by trying to query them
+        supabase.table('users').select('id').limit(1).execute()
+        supabase.table('documents').select('id').limit(1).execute()
+        return True
+    except Exception as e:
+        st.error(f"Database tables don't exist or connection failed: {str(e)}")
+        st.info("Please create the required tables in your Supabase dashboard using the SQL provided in the setup instructions.")
+        return False
 
 def hash_password(password):
+    """Hash password using SHA-256"""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def create_user(username, email, password):
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
+    """Create a new user"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return None
+    
     try:
-        password_hash = hash_password(password)
-        c.execute("INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-                  (username, email, password_hash))
-        conn.commit()
-        user_id = c.lastrowid
-        conn.close()
-        return user_id
-    except sqlite3.IntegrityError:
-        conn.close()
+        user_data = {
+            "username": username,
+            "email": email,
+            "password_hash": hash_password(password),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase.table('users').insert(user_data).execute()
+        
+        if result.data:
+            return result.data[0]['id']
+        return None
+    except Exception as e:
+        if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
+            return None  # User already exists
+        st.error(f"Error creating user: {str(e)}")
         return None
 
 def authenticate_user(username, password):
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
-    password_hash = hash_password(password)
-    c.execute("SELECT id, username FROM users WHERE username = ? AND password_hash = ?",
-              (username, password_hash))
-    user = c.fetchone()
-    conn.close()
-    return user
+    """Authenticate user login"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return None
+    
+    try:
+        result = supabase.table('users').select('id, username').eq(
+            'username', username
+        ).eq(
+            'password_hash', hash_password(password)
+        ).execute()
+        
+        if result.data:
+            user = result.data[0]
+            return (user['id'], user['username'])
+        return None
+    except Exception as e:
+        st.error(f"Authentication error: {str(e)}")
+        return None
 
 def save_document(user_id, doc_name, extracted_texts, image_names, settings):
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
-    c.execute("""INSERT INTO documents 
-                 (user_id, doc_name, extracted_texts, image_names, processing_settings) 
-                 VALUES (?, ?, ?, ?, ?)""",
-              (user_id, doc_name, json.dumps(extracted_texts), 
-               json.dumps(image_names), json.dumps(settings)))
-    conn.commit()
-    doc_id = c.lastrowid
-    conn.close()
-    return doc_id
+    """Save document to database"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return None
+    
+    try:
+        doc_data = {
+            "user_id": user_id,
+            "doc_name": doc_name,
+            "extracted_texts": json.dumps(extracted_texts),
+            "image_names": json.dumps(image_names),
+            "processing_settings": json.dumps(settings),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase.table('documents').insert(doc_data).execute()
+        
+        if result.data:
+            return result.data[0]['id']
+        return None
+    except Exception as e:
+        st.error(f"Error saving document: {str(e)}")
+        return None
 
 def get_user_documents(user_id):
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
-    c.execute("""SELECT id, doc_name, extracted_texts, image_names, 
-                 processing_settings, created_at 
-                 FROM documents WHERE user_id = ? ORDER BY created_at DESC""",
-              (user_id,))
-    docs = c.fetchall()
-    conn.close()
-    return docs
+    """Get all documents for a user"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return []
+    
+    try:
+        result = supabase.table('documents').select(
+            'id, doc_name, extracted_texts, image_names, processing_settings, created_at'
+        ).eq('user_id', user_id).order('created_at', desc=True).execute()
+        
+        docs = []
+        for doc in result.data:
+            docs.append((
+                doc['id'],
+                doc['doc_name'],
+                doc['extracted_texts'],
+                doc['image_names'],
+                doc['processing_settings'],
+                doc['created_at']
+            ))
+        
+        return docs
+    except Exception as e:
+        st.error(f"Error fetching documents: {str(e)}")
+        return []
 
 def delete_document(user_id, doc_id):
-    conn = sqlite3.connect('ocr_app.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM documents WHERE id = ? AND user_id = ?", (doc_id, user_id))
-    conn.commit()
-    conn.close()
+    """Delete a document"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    
+    try:
+        result = supabase.table('documents').delete().eq(
+            'id', doc_id
+        ).eq('user_id', user_id).execute()
+        
+        return len(result.data) > 0
+    except Exception as e:
+        st.error(f"Error deleting document: {str(e)}")
+        return False
 
 # Initialize database
-init_db()
+if 'db_initialized' not in st.session_state:
+    st.session_state.db_initialized = init_db()
 
 # Streamlit page config
 st.set_page_config(
@@ -126,6 +194,7 @@ st.markdown("""
     .processed-image {border: 2px solid #4CAF50; border-radius: 10px; padding: 10px; margin: 10px 0; background-color: #f0f8f0;}
     .user-info {background: linear-gradient(90deg, #4285F4, #34A853); color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; margin-bottom: 1rem;}
     .document-card {border: 1px solid #ddd; border-radius: 0.5rem; padding: 1rem; margin: 0.5rem 0; background-color: #f9f9f9;}
+    .formatting-panel {border: 2px solid #4285F4; border-radius: 0.5rem; padding: 1rem; margin: 1rem 0; background-color: #f8f9ff;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,6 +211,8 @@ if 'processed_images' not in st.session_state:
     st.session_state.processed_images = []
 if 'api_key_valid' not in st.session_state:
     st.session_state.api_key_valid = False
+if 'show_formatting_panel' not in st.session_state:
+    st.session_state.show_formatting_panel = False
 
 # Authentication functions
 def show_login():
@@ -191,8 +262,51 @@ def show_signup():
                 else:
                     st.error("Username or email already exists")
 
+def show_supabase_setup():
+    """Show Supabase setup instructions if needed"""
+    st.markdown("""
+    ## ⚠️ Database Setup Required
+    
+    Please create the following tables in your Supabase dashboard:
+    
+    ```sql
+    -- Users table
+    CREATE TABLE users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(64) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- Documents table
+    CREATE TABLE documents (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        doc_name TEXT NOT NULL,
+        extracted_texts TEXT NOT NULL,
+        image_names TEXT NOT NULL,
+        processing_settings TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+    
+    -- Create indexes
+    CREATE INDEX idx_documents_user_id ON documents(user_id);
+    CREATE INDEX idx_documents_created_at ON documents(created_at);
+    ```
+    
+    Go to your Supabase project → SQL Editor → Run the above SQL commands.
+    """)
+
 # API key fetch
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+# Check database initialization
+if not st.session_state.db_initialized:
+    st.error("Database connection failed or tables don't exist.")
+    show_supabase_setup()
+    st.stop()
 
 # Authentication check
 if not st.session_state.authenticated:
@@ -296,24 +410,19 @@ else:
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        # Download as DOCX
+                        # Download as DOCX with formatting
                         if st.button(f"Download DOCX", key=f"docx_{doc_id}"):
                             try:
-                                doc = Document()
-                                doc.add_heading('Gemini Vision OCR - Multi-Image', 0)
-                                doc.add_paragraph(f"Document: {doc_name}")
-                                doc.add_paragraph(f"Created: {created_at}")
-                                doc.add_paragraph(f"Language: {settings.get('target_language', 'N/A')}")
-                                doc.add_paragraph(f"OCR Mode: {settings.get('ocr_mode', 'N/A')}")
-                                
-                                for idx, text in enumerate(extracted_texts):
-                                    if settings.get('separate_pages', True) and idx > 0:
-                                        doc.add_page_break()
-                                    doc.add_heading(f"Image {idx + 1}: {image_names[idx]}", level=1)
-                                    doc.add_paragraph(text)
+                                formatted_doc = create_formatted_document(
+                                    doc_name, extracted_texts, image_names, settings,
+                                    font_name="Calibri", font_size=11, line_spacing=1.15,
+                                    margin_top=1.0, margin_bottom=1.0, margin_left=1.0, margin_right=1.0,
+                                    separate_pages=settings.get('separate_pages', True),
+                                    include_images=settings.get('include_images_in_docx', True)
+                                )
                                 
                                 doc_buffer = io.BytesIO()
-                                doc.save(doc_buffer)
+                                formatted_doc.save(doc_buffer)
                                 doc_buffer.seek(0)
                                 
                                 st.download_button(
@@ -354,6 +463,190 @@ else:
                             st.success("Document deleted!")
                             st.rerun()
 
+    def create_formatted_document(doc_name, extracted_texts, image_names, settings, 
+                                font_name="Calibri", font_size=11, line_spacing=1.15,
+                                margin_top=1.0, margin_bottom=1.0, margin_left=1.0, margin_right=1.0,
+                                separate_pages=True, include_images=True, preserve_original_formatting=True,
+                                add_page_numbers=False, **kwargs):
+        """Create a formatted Word document"""
+        doc = Document()
+        
+        # Set document margins
+        sections = doc.sections
+        for section in sections:
+            section.top_margin = Inches(margin_top)
+            section.bottom_margin = Inches(margin_bottom)
+            section.left_margin = Inches(margin_left)
+            section.right_margin = Inches(margin_right)
+            
+            # Add page numbers if requested
+            if add_page_numbers:
+                try:
+                    from docx.oxml.shared import qn
+                    from docx.oxml import parse_xml
+                    footer = section.footer
+                    footer_para = footer.paragraphs[0]
+                    footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    # Add page number field
+                    run = footer_para.runs[0] if footer_para.runs else footer_para.add_run()
+                    fldChar1 = parse_xml(r'<w:fldChar w:fldCharType="begin" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>')
+                    instrText = parse_xml(r'<w:instrText xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"> PAGE </w:instrText>')
+                    fldChar2 = parse_xml(r'<w:fldChar w:fldCharType="end" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>')
+                    
+                    run._r.append(fldChar1)
+                    run._r.append(instrText)
+                    run._r.append(fldChar2)
+                    
+                    # Style the page number
+                    run.font.name = font_name
+                    run.font.size = Pt(font_size - 2)
+                except Exception as e:
+                    # If page numbering fails, continue without it
+                    pass
+        
+        # Create custom styles
+        styles = doc.styles
+        
+        # Title style
+        if 'CustomTitle' not in [style.name for style in styles]:
+            title_style = styles.add_style('CustomTitle', WD_STYLE_TYPE.PARAGRAPH)
+            title_font = title_style.font
+            title_font.name = font_name
+            title_font.size = Pt(font_size + 4)
+            title_font.bold = True
+            title_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            title_style.paragraph_format.space_after = Pt(12)
+        
+        # Heading style
+        if 'CustomHeading' not in [style.name for style in styles]:
+            heading_style = styles.add_style('CustomHeading', WD_STYLE_TYPE.PARAGRAPH)
+            heading_font = heading_style.font
+            heading_font.name = font_name
+            heading_font.size = Pt(font_size + 2)
+            heading_font.bold = True
+            heading_style.paragraph_format.space_before = Pt(12)
+            heading_style.paragraph_format.space_after = Pt(6)
+        
+        # Body style
+        if 'CustomBody' not in [style.name for style in styles]:
+            body_style = styles.add_style('CustomBody', WD_STYLE_TYPE.PARAGRAPH)
+            body_font = body_style.font
+            body_font.name = font_name
+            body_font.size = Pt(font_size)
+            body_style.paragraph_format.line_spacing = line_spacing
+            body_style.paragraph_format.space_after = Pt(6)
+        
+        # Add title
+        title = doc.add_paragraph('Gemini Vision OCR - Multi-Image', style='CustomTitle')
+        
+        # Add metadata
+        doc.add_paragraph(f"Document: {doc_name}", style='CustomBody')
+        doc.add_paragraph(f"Extraction Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style='CustomBody')
+        doc.add_paragraph(f"Language: {settings.get('target_language', 'N/A')}", style='CustomBody')
+        doc.add_paragraph(f"OCR Mode: {settings.get('ocr_mode', 'N/A')}", style='CustomBody')
+        doc.add_paragraph("", style='CustomBody')  # Empty line
+        
+        # Add content for each image
+        for idx, text in enumerate(extracted_texts):
+            if separate_pages and idx > 0:
+                doc.add_page_break()
+            
+            # Add image heading
+            doc.add_heading(f"Image {idx + 1}: {image_names[idx]}", level=1).style = 'CustomHeading'
+            
+            # Add image if requested and available
+            if include_images and idx < len(st.session_state.processed_images):
+                try:
+                    img_stream = io.BytesIO()
+                    st.session_state.processed_images[idx][1].save(img_stream, format='PNG')
+                    img_stream.seek(0)
+                    
+                    paragraph = doc.add_paragraph()
+                    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                    run.add_picture(img_stream, width=Inches(4))
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    doc.add_paragraph("", style='CustomBody')  # Empty line after image
+                except Exception as e:
+                    doc.add_paragraph(f"[Could not embed image: {str(e)}]", style='CustomBody')
+            
+            # Add extracted text
+            if preserve_original_formatting and text:
+                # Split text into paragraphs and preserve formatting
+                paragraphs = text.split('\n')
+                for para_text in paragraphs:
+                    if para_text.strip():
+                        para = doc.add_paragraph(style='CustomBody')
+                        
+                        # Check for special formatting
+                        if para_text.strip().isupper() and len(para_text.strip()) < 100:
+                            # Likely a heading - make it bold
+                            run = para.add_run(para_text)
+                            run.bold = True
+                        elif para_text.startswith('    ') or para_text.startswith('\t'):
+                            # Indented text - preserve indentation
+                            run = para.add_run(para_text)
+                        else:
+                            run = para.add_run(para_text)
+                    else:
+                        doc.add_paragraph("", style='CustomBody')  # Empty line
+            else:
+                # Simple paragraph addition
+                doc.add_paragraph(text, style='CustomBody')
+            
+            # Add spacing between sections
+            if idx < len(extracted_texts) - 1:
+                doc.add_paragraph("", style='CustomBody')
+        
+        return doc
+    
+    def show_formatting_panel():
+        """Show the formatting panel for DOCX customization"""
+        st.markdown('<div class="formatting-panel">', unsafe_allow_html=True)
+        st.subheader("📝 Document Formatting Options")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.write("**Font Settings**")
+            font_name = st.selectbox("Font Family", 
+                ["Calibri", "Arial", "Times New Roman", "Georgia", "Verdana", "Cambria", "Tahoma"], 
+                index=0, key="format_font")
+            font_size = st.slider("Font Size", 8, 24, 11, key="format_size")
+            line_spacing = st.selectbox("Line Spacing", 
+                [1.0, 1.15, 1.5, 2.0], 
+                index=1, key="format_spacing")
+        
+        with col2:
+            st.write("**Page Settings**")
+            margin_top = st.slider("Top Margin (inches)", 0.5, 2.0, 1.0, 0.1, key="margin_top")
+            margin_bottom = st.slider("Bottom Margin (inches)", 0.5, 2.0, 1.0, 0.1, key="margin_bottom")
+            margin_left = st.slider("Left Margin (inches)", 0.5, 2.0, 1.0, 0.1, key="margin_left")
+            margin_right = st.slider("Right Margin (inches)", 0.5, 2.0, 1.0, 0.1, key="margin_right")
+        
+        with col3:
+            st.write("**Document Options**")
+            separate_pages = st.checkbox("Each image on new page", value=True, key="format_separate")
+            include_images = st.checkbox("Include images in document", value=True, key="format_images")
+            preserve_original_formatting = st.checkbox("Preserve original formatting", value=True, key="format_preserve")
+            add_page_numbers = st.checkbox("Add page numbers", value=False, key="format_page_nums")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        return {
+            'font_name': font_name,
+            'font_size': font_size,
+            'line_spacing': line_spacing,
+            'margin_top': margin_top,
+            'margin_bottom': margin_bottom,
+            'margin_left': margin_left,
+            'margin_right': margin_right,
+            'separate_pages': separate_pages,
+            'include_images': include_images,
+            'preserve_original_formatting': preserve_original_formatting,
+            'add_page_numbers': add_page_numbers
+        }
+
     with tab1:  # OCR Processing tab
         if not GEMINI_API_KEY:
             st.markdown("""
@@ -382,8 +675,6 @@ else:
 
                 st.subheader("Processing Options")
                 preserve_formatting = st.checkbox("Preserve text formatting", value=True)
-                fix_grammar = st.checkbox("Auto-fix grammar and spelling", value=False)
-                include_confidence = st.checkbox("Mark uncertain words with [?]", value=False)
                 include_images_in_docx = st.checkbox("Include images in DOCX", value=True)
                 st.divider()
 
@@ -496,10 +787,6 @@ else:
                     else:
                         base_prompt += " Preserve basic paragraph structure and line breaks."
                         
-                    if fix_grammar:
-                        base_prompt += " Fix any obvious spelling or grammar errors while maintaining the original meaning and formatting."
-                    if include_confidence:
-                        base_prompt += " If you're uncertain about any words, add [?] after them."
                     base_prompt += "\n\nProvide ONLY the extracted text in plain text format. NO HTML tags, NO markup. Use spaces for indentation and underscores or CAPITALS for emphasis."
                     return base_prompt
 
@@ -572,8 +859,7 @@ else:
                                         'target_language': target_language,
                                         'ocr_mode': ocr_mode,
                                         'preserve_formatting': preserve_formatting,
-                                        'fix_grammar': fix_grammar,
-                                        'include_confidence': include_confidence,
+                                        'include_images_in_docx': include_images_in_docx,
                                         'separate_pages': separate_pages
                                     }
                                     
@@ -585,8 +871,11 @@ else:
                                         settings
                                     )
                                     
-                                    st.success(f"Document '{doc_name}' saved successfully!")
-                                    st.markdown('<div class="info-box">You can view and download your saved documents from the "My Documents" tab.</div>', unsafe_allow_html=True)
+                                    if doc_id:
+                                        st.success(f"Document '{doc_name}' saved successfully!")
+                                        st.markdown('<div class="info-box">You can view and download your saved documents from the "My Documents" tab.</div>', unsafe_allow_html=True)
+                                    else:
+                                        st.error("Failed to save document. Please try again.")
                                     
                                 except Exception as e:
                                     st.error(f"Error saving document: {str(e)}")
@@ -595,29 +884,47 @@ else:
 
                         st.divider()
                         
+                        # Formatting Panel Toggle
+                        if st.button("📝 Advanced Formatting Options"):
+                            st.session_state.show_formatting_panel = not st.session_state.show_formatting_panel
+                        
+                        # Show formatting panel if enabled
+                        format_settings = None
+                        if st.session_state.show_formatting_panel:
+                            format_settings = show_formatting_panel()
+                        
                         # Quick download options
                         if st.button("Quick Download as DOCX"):
                             try:
-                                doc = Document()
-                                doc.add_heading('Gemini Vision OCR - Multi-Image', 0)
-                                doc.add_paragraph(f"Extraction Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                                doc.add_paragraph(f"Target Language: {target_language}")
-                                doc.add_paragraph(f"OCR Mode: {ocr_mode}")
-
-                                for idx, (filename, image) in enumerate(st.session_state.processed_images):
-                                    if separate_pages and idx > 0:
-                                        doc.add_page_break()
-                                    doc.add_heading(f"Image {idx + 1}: {filename}", level=1)
-                                    doc.add_paragraph(st.session_state.all_extracted_texts[idx])
-                                    
+                                if format_settings:
+                                    # Use custom formatting
+                                    formatted_doc = create_formatted_document(
+                                        doc_name or f"OCR_Document_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                        st.session_state.all_extracted_texts,
+                                        [img[0] for img in st.session_state.processed_images],
+                                        {'target_language': target_language, 'ocr_mode': ocr_mode},
+                                        **format_settings
+                                    )
+                                else:
+                                    # Use default formatting
+                                    formatted_doc = create_formatted_document(
+                                        doc_name or f"OCR_Document_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                        st.session_state.all_extracted_texts,
+                                        [img[0] for img in st.session_state.processed_images],
+                                        {'target_language': target_language, 'ocr_mode': ocr_mode},
+                                        font_name="Calibri", font_size=11, line_spacing=1.15,
+                                        margin_top=1.0, margin_bottom=1.0, margin_left=1.0, margin_right=1.0,
+                                        separate_pages=separate_pages, include_images=include_images_in_docx
+                                    )
+                                
                                 doc_buffer = io.BytesIO()
-                                doc.save(doc_buffer)
+                                formatted_doc.save(doc_buffer)
                                 doc_buffer.seek(0)
                                 
                                 st.download_button(
-                                    label="Download DOCX",
+                                    label="Download Formatted DOCX",
                                     data=doc_buffer.getvalue(),
-                                    file_name=f"extracted_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                                    file_name=f"formatted_{doc_name or 'extracted_text'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
                                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                                 )
                             except Exception as e:
