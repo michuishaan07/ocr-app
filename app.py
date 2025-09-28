@@ -21,8 +21,13 @@ load_dotenv()
 def get_supabase_client():
     """Get Supabase client"""
     try:
-        url = os.getenv('SUPABASE_URL')
-        key = os.getenv('SUPABASE_ANON_KEY')
+        # url = os.getenv('SUPABASE_URL')
+        # key = os.getenv('SUPABASE_ANON_KEY')\
+
+
+        url = st.secrets.get('SUPABASE_URL')
+        key = st.secrets.get('SUPABASE_ANON_KEY')
+        
         
         if not url or not key:
             st.error("Supabase URL and key are required in environment variables")
